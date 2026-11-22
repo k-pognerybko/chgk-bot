@@ -128,8 +128,8 @@ def continue_keyboard(index: int, last: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text=forward, callback_data=f"n:{index}"),
                 InlineKeyboardButton(text="Стоп", callback_data="s"),
+                InlineKeyboardButton(text=forward, callback_data=f"n:{index}"),
             ]
         ]
     )
