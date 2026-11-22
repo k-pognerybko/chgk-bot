@@ -116,8 +116,8 @@ def question_keyboard(index: int, last: bool) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="Показать ответ", callback_data=f"a:{index}")],
             [
-                InlineKeyboardButton(text=forward, callback_data=f"n:{index}"),
                 InlineKeyboardButton(text="Стоп", callback_data="s"),
+                InlineKeyboardButton(text=forward, callback_data=f"n:{index}"),
             ],
         ]
     )
