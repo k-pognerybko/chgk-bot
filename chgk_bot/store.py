@@ -7,7 +7,11 @@ from pathlib import Path
 from chgk_bot.parser import Pack, Question
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PATH = ROOT / "data" / "games.sqlite"
+DEFAULT_PATH = (
+    Path("/data/games.sqlite")
+    if Path("/data").is_dir()
+    else ROOT / "data" / "games.sqlite"
+)
 
 _connection: sqlite3.Connection | None = None
 _path = DEFAULT_PATH
