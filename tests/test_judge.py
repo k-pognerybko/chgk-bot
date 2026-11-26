@@ -44,6 +44,19 @@ class JudgeTest(unittest.TestCase):
         cucumber = question(answer="[солёный] огурец")
         self.assertEqual(judge(cucumber, "соленые огурцы"), Verdict.CLOSE)
 
+    def test_symbol_with_clarification(self) -> None:
+        item = question(answer="# [знак решётки].")
+        self.assertEqual(judge(item, "#"), Verdict.CORRECT)
+        self.assertEqual(judge(item, "#."), Verdict.CORRECT)
+        self.assertEqual(judge(item, "ответ: #"), Verdict.CORRECT)
+        self.assertEqual(judge(item, "знак решетки"), Verdict.CORRECT)
+        self.assertEqual(judge(item, "решетка"), Verdict.WRONG)
+        self.assertEqual(judge(question(answer="... [многоточие]."), "..."), Verdict.CORRECT)
+        self.assertEqual(judge(question(answer="..."), "."), Verdict.WRONG)
+        self.assertEqual(judge(question(answer="#"), "C#"), Verdict.WRONG)
+        self.assertEqual(judge(question(answer="футбол"), "#"), Verdict.WRONG)
+        self.assertEqual(judge(question(answer="C#"), "C#"), Verdict.CORRECT)
+
     def test_missing_answer(self) -> None:
         self.assertEqual(judge(question(), "что угодно"), Verdict.UNKNOWN)
 

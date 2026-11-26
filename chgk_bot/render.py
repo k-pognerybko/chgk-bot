@@ -50,7 +50,9 @@ def render_pack_card(pack: Pack) -> str:
         lines.append("")
         lines.append(esc(clip(pack.blurb, 500)))
     lines.append("")
-    lines.append("Свою версию пришлите ответом на сообщение с вопросом: при зачёте ответ откроется сразу.")
+    lines.append(
+        "Свою версию пришлите ответом на сообщение бота по этому вопросу или командой /a текст."
+    )
     lines.append(f'<a href="{esc_attr(pack.url)}">Пакет на GotQuestions</a>')
     return "\n".join(lines)
 
@@ -82,6 +84,24 @@ def render_recent_packs(packs: list[PackPreview]) -> str:
             lines.append(" · ".join(details))
         lines.append(f"/play {pack.url}")
     return "\n".join(lines)
+
+
+def render_where(
+    title: str,
+    question: Question,
+    position: int,
+    total: int,
+    revealed: bool,
+    started: bool,
+) -> str:
+    name = f"<b>{esc(title)}</b>"
+    if not started:
+        return f"Пакет {name} открыт. Нажмите «Начать игру»."
+    where = f"Вопрос {question.number} ({position}/{total})"
+    if question.tour_title:
+        where = f"{esc(question.tour_title)} · {where}"
+    state = "Ответ открыт." if revealed else "Ответ ещё не открыт."
+    return "\n".join((name, where, state, "Другой номер: /q 12"))
 
 
 def render_tour(question: Question) -> str:

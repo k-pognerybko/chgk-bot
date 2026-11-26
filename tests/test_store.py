@@ -1,10 +1,20 @@
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from chgk_bot.bot import Game
 from chgk_bot.parser import Pack, Question
-from chgk_bot.store import DEFAULT_PATH, delete_game, load_games, locate_question, save_game, use_path
+from chgk_bot.store import (
+    DEFAULT_PATH,
+    _pack_to_dict,
+    delete_game,
+    load_games,
+    locate_question,
+    save_game,
+    use_path,
+)
 
 
 def sample_pack() -> Pack:
@@ -44,6 +54,7 @@ class StoreTest(unittest.TestCase):
         game.revealed = True
         game.started = True
         game.question_message_id = 55
+        game.message_ids = [40, 55]
         save_game(game)
 
         restored = load_games()
@@ -54,10 +65,47 @@ class StoreTest(unittest.TestCase):
         self.assertTrue(loaded.revealed)
         self.assertTrue(loaded.started)
         self.assertEqual(loaded.question_message_id, 55)
+        self.assertEqual(loaded.message_ids, [40, 55])
+        self.assertTrue(loaded.tracks(40))
         self.assertEqual(loaded.question.answer, "б")
 
         delete_game(7, None)
         self.assertEqual(load_games(), {})
+
+    def test_old_database_keeps_reply_to_question(self) -> None:
+        path = Path(self.directory.name) / "old.sqlite"
+        connection = sqlite3.connect(path)
+        connection.execute(
+            """
+            CREATE TABLE games (
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                pack_json TEXT NOT NULL,
+                question_index INTEGER NOT NULL,
+                revealed INTEGER NOT NULL,
+                started INTEGER NOT NULL,
+                question_message_id INTEGER,
+                PRIMARY KEY (chat_id, thread_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO games (
+                chat_id, thread_id, pack_json, question_index, revealed, started, question_message_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (7, 0, json.dumps(_pack_to_dict(sample_pack()), ensure_ascii=False), 1, 0, 1, 55),
+        )
+        connection.commit()
+        connection.close()
+
+        use_path(path)
+        loaded = load_games()[(7, 0)]
+        self.assertEqual(loaded.question_message_id, 55)
+        self.assertEqual(loaded.message_ids, [55])
+        self.assertTrue(loaded.tracks(55))
 
 
 if __name__ == "__main__":
