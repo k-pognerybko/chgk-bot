@@ -47,6 +47,7 @@ from chgk_bot.render import (
     render_question,
     render_recent_packs,
     render_tour,
+    render_where,
 )
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -58,13 +59,17 @@ PACK_IN_TEXT = re.compile(r"gotquestions\.online/pack/\d+", re.IGNORECASE)
 HELP = (
     "Это ведущий для «Что? Где? Когда?».\n\n"
     "Пришлите ссылку на пакет с gotquestions.online — бот откроет вопросы по одному. "
-    "Свою версию пришлите ответом на сообщение с вопросом. "
+    "Свою версию пришлите ответом на любое сообщение бота по этому вопросу "
+    "(текст, раздатку или заголовок тура) или командой /a текст. "
     "При зачёте бот сразу покажет ответ, иначе напишет «незачёт» или «похоже». "
-    "Кнопка «Показать ответ» открывает его в любой момент.\n\n"
+    "Кнопка «Показать ответ» открывает его в любой момент. "
+    "Если вопрос уехал вверх, /q пришлёт его снова.\n\n"
     "В группе удобнее команды, их бот видит всегда:\n"
     "/packs — свежие пакеты с сайта\n"
     "/play https://gotquestions.online/pack/5771\n"
-    "/q 12 — перейти к вопросу 12\n\n"
+    "/q — какой сейчас вопрос\n"
+    "/q 12 — перейти к вопросу 12\n"
+    "/a текст — сдать версию\n\n"
     "Вопросы принадлежат их авторам. Бот показывает текст как на сайте, "
     "с именем автора и ссылкой на пакет. Играйте в своей компании, "
     "без коммерческого использования.\n\n"
@@ -84,8 +89,9 @@ class Game:
         self.revealed = False
         self.started = False
         self.token = 0
-        self.lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
         self.question_message_id: int | None = None
+        self.message_ids: list[int] = []
 
     @property
     def question(self) -> Question:
@@ -96,6 +102,29 @@ class Game:
         if self.thread_id:
             data["message_thread_id"] = self.thread_id
         return data
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def tracks(self, message_id: int) -> bool:
+        if message_id == self.question_message_id:
+            return True
+        return message_id in self.message_ids
+
+    def remember(self, message_ids: list[int], *, keep: bool) -> None:
+        if keep:
+            for message_id in message_ids:
+                if message_id not in self.message_ids:
+                    self.message_ids.append(message_id)
+        else:
+            self.message_ids = list(message_ids)
+        if len(self.message_ids) > 40:
+            self.message_ids = self.message_ids[-40:]
+        if self.question_message_id and self.question_message_id not in self.message_ids:
+            self.message_ids.append(self.question_message_id)
 
 
 def game_key(chat_id: int, thread_id: int | None) -> tuple[int, int]:
@@ -110,29 +139,66 @@ def start_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def forward_button(index: int, last: bool) -> InlineKeyboardButton:
+    text = "Закончить" if last else "Дальше"
+    return InlineKeyboardButton(text=text, callback_data=f"n:{index}")
+
+
 def question_keyboard(index: int, last: bool) -> InlineKeyboardMarkup:
-    forward = "Закончить" if last else "Дальше"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Показать ответ", callback_data=f"a:{index}")],
             [
                 InlineKeyboardButton(text="Стоп", callback_data="s"),
-                InlineKeyboardButton(text=forward, callback_data=f"n:{index}"),
+                forward_button(index, last),
             ],
         ]
     )
 
 
 def continue_keyboard(index: int, last: bool) -> InlineKeyboardMarkup:
-    forward = "Закончить" if last else "Дальше"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="Стоп", callback_data="s"),
-                InlineKeyboardButton(text=forward, callback_data=f"n:{index}"),
+                forward_button(index, last),
             ]
         ]
     )
+
+
+def where_keyboard(game: Game) -> InlineKeyboardMarkup:
+    if not game.started:
+        return start_keyboard()
+    last = game.index + 1 == len(game.pack.questions)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Ещё раз", callback_data=f"r:{game.index}"),
+                forward_button(game.index, last),
+            ]
+        ]
+    )
+
+
+async def call_telegram(action, /, *args, **kwargs):
+    try:
+        return await action(*args, **kwargs)
+    except TelegramNetworkError:
+        LOG.warning("telegram request failed, retrying once", exc_info=True)
+        return await action(*args, **kwargs)
+
+
+async def ack(callback: CallbackQuery, notice: str = "") -> None:
+    try:
+        await call_telegram(callback.answer, notice or None)
+    except Exception:
+        LOG.warning("could not answer callback", exc_info=True)
+        if notice and isinstance(callback.message, Message):
+            try:
+                await call_telegram(callback.message.answer, notice)
+            except Exception:
+                LOG.debug("could not deliver callback notice", exc_info=True)
 
 
 async def open_pack(message: Message, url: str) -> None:
@@ -157,33 +223,52 @@ async def open_pack(message: Message, url: str) -> None:
     )
 
 
-async def send_photos(bot: Bot, game: Game, urls: list[str]) -> list[str]:
+async def send_photos(
+    bot: Bot, game: Game, urls: list[str], token: int | None = None
+) -> tuple[list[str], list[int]]:
     failed: list[str] = []
+    sent_ids: list[int] = []
     for url in urls[:8]:
+        if token is not None and game.token != token:
+            break
         try:
-            await bot.send_photo(photo=url, **game.target())
+            sent = await call_telegram(bot.send_photo, photo=url, **game.target())
         except Exception:
             LOG.warning("photo failed: %s", url)
             failed.append(url)
-    return failed
+            continue
+        sent_ids.append(sent.message_id)
+    return failed, sent_ids
 
 
-async def show_question(bot: Bot, game: Game) -> None:
+async def show_question(
+    bot: Bot,
+    game: Game,
+    *,
+    announce_tour: bool = True,
+    keep_messages: bool = False,
+) -> None:
     token = game.token
     question = game.question
     previous = game.pack.questions[game.index - 1] if game.index else None
+    sent_ids: list[int] = []
     if game.token != token:
         return
-    if previous is None or previous.tour_title != question.tour_title:
+    if announce_tour and (previous is None or previous.tour_title != question.tour_title):
         if question.tour_title:
-            await bot.send_message(
+            tour = await call_telegram(
+                bot.send_message,
                 text=render_tour(question),
                 link_preview_options=LINK_OFF,
                 **game.target(),
             )
+            sent_ids.append(tour.message_id)
     if game.token != token:
         return
-    failed_images = await send_photos(bot, game, question.handout_images + question.images)
+    failed_images, photo_ids = await send_photos(
+        bot, game, question.handout_images + question.images, token
+    )
+    sent_ids.extend(photo_ids)
     text = render_question(question, game.index + 1, len(game.pack.questions))
     if failed_images:
         links = "\n".join(
@@ -192,17 +277,40 @@ async def show_question(bot: Bot, game: Game) -> None:
         text = links + "\n\n" + text
     if game.token != token:
         return
-    sent = await bot.send_message(
+    last = game.index + 1 == len(game.pack.questions)
+    if game.revealed:
+        keyboard = continue_keyboard(game.index, last)
+    else:
+        keyboard = question_keyboard(game.index, last)
+    sent = await call_telegram(
+        bot.send_message,
         text=text,
-        reply_markup=question_keyboard(game.index, game.index + 1 == len(game.pack.questions)),
+        reply_markup=keyboard,
         link_preview_options=LINK_OFF,
         **game.target(),
     )
     if game.token != token:
         return
     game.question_message_id = sent.message_id
-    game.revealed = False
+    sent_ids.append(sent.message_id)
+    game.remember(sent_ids, keep=keep_messages)
     save_game(game)
+
+
+async def present(bot: Bot, game: Game, message: Message | None, **kwargs) -> None:
+    try:
+        await show_question(bot, game, **kwargs)
+    except Exception:
+        LOG.exception("failed to show question")
+        if not isinstance(message, Message):
+            return
+        try:
+            await call_telegram(
+                message.answer,
+                "Не получилось отправить вопрос. Откройте /q и нажмите «Ещё раз».",
+            )
+        except Exception:
+            LOG.debug("could not report show failure", exc_info=True)
 
 
 async def reveal(bot: Bot, game: Game, token: int, index: int) -> bool:
@@ -213,30 +321,41 @@ async def reveal(bot: Bot, game: Game, token: int, index: int) -> bool:
         question = game.question
         last = index + 1 == len(game.pack.questions)
         message_id = game.question_message_id
+    try:
+        comment_images = [
+            url for url in question.comment_images if url not in set(question.handout_images)
+        ]
+        _, photo_ids = await send_photos(bot, game, comment_images)
+        sent = await call_telegram(
+            bot.send_message,
+            text=render_answer(question),
+            reply_markup=continue_keyboard(index, last),
+            link_preview_options=LINK_OFF,
+            **game.target(),
+        )
+    except Exception:
+        async with game.lock:
+            if game.token == token and game.index == index and game.revealed:
+                game.revealed = False
+        raise
     if message_id is not None:
         try:
-            await bot.edit_message_reply_markup(
+            await call_telegram(
+                bot.edit_message_reply_markup,
                 chat_id=game.chat_id,
                 message_id=message_id,
                 reply_markup=continue_keyboard(index, last),
             )
         except Exception:
             LOG.debug("could not update question keyboard", exc_info=True)
-    comment_images = [
-        url for url in question.comment_images if url not in set(question.handout_images)
-    ]
-    await send_photos(bot, game, comment_images)
-    await bot.send_message(
-        text=render_answer(question),
-        reply_markup=continue_keyboard(index, last),
-        link_preview_options=LINK_OFF,
-        **game.target(),
-    )
+    async with game.lock:
+        if game.token == token and game.index == index:
+            game.remember(photo_ids + [sent.message_id], keep=True)
     save_game(game)
     return True
 
 
-async def go_next(bot: Bot, game: Game, index: int) -> str | None:
+async def move_question(game: Game, index: int) -> str | None:
     async with game.lock:
         if game.index != index:
             return "Это уже не тот вопрос."
@@ -246,7 +365,16 @@ async def go_next(bot: Bot, game: Game, index: int) -> str | None:
         game.token += 1
         game.revealed = False
         game.started = True
-    await show_question(bot, game)
+    return None
+
+
+async def repeat_question(game: Game, index: int) -> str | None:
+    async with game.lock:
+        if not game.started:
+            return "Игра ещё не начата."
+        if game.index != index:
+            return "Это уже не тот вопрос."
+        game.token += 1
     return None
 
 
@@ -271,9 +399,21 @@ async def cmd_question(message: Message, command: CommandObject) -> None:
     raw = command.args or ""
     match = re.search(r"\d+", raw)
     if match is None:
-        current = game.question.number if game.started else None
-        hint = f"Сейчас вопрос {current}. " if current is not None else ""
-        await message.answer(f"{hint}Переход: /q 12")
+        sent = await message.answer(
+            render_where(
+                game.pack.title,
+                game.question,
+                game.index + 1,
+                len(game.pack.questions),
+                game.revealed,
+                game.started,
+            ),
+            reply_markup=where_keyboard(game),
+            link_preview_options=LINK_OFF,
+        )
+        if game.started:
+            game.remember([sent.message_id], keep=True)
+            save_game(game)
         return
     number = int(match.group())
     index = locate_question(game.pack.questions, number)
@@ -290,7 +430,23 @@ async def cmd_question(message: Message, command: CommandObject) -> None:
     if message.bot is None:
         await message.answer("Не получилось показать вопрос.")
         return
-    await show_question(message.bot, game)
+    await present(message.bot, game, message)
+
+
+@router.message(Command("a"))
+async def cmd_version(message: Message, command: CommandObject) -> None:
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer("Напишите версию после команды: /a ваш ответ")
+        return
+    game = _games.get(game_key(message.chat.id, message.message_thread_id))
+    if game is None:
+        await message.answer("Сейчас нет пакета. Откройте его через /play или /packs.")
+        return
+    if not game.started:
+        await message.answer("Игра ещё не начата.")
+        return
+    await submit_version(message, game, text)
 
 
 @router.message(Command("stop"))
@@ -367,16 +523,25 @@ async def on_guess(message: Message) -> None:
     reply = message.reply_to_message
     if game is None or not game.started or reply is None:
         return
-    if reply.from_user is not None and not reply.from_user.is_bot:
+    if message.bot is None or reply.from_user is None or reply.from_user.id != message.bot.id:
         return
-    if reply.message_id != game.question_message_id:
-        await message.reply("Ответьте на сообщение с текущим вопросом.")
+    if not game.tracks(reply.message_id):
+        await call_telegram(
+            message.reply,
+            "Это не текущий вопрос. Ответьте на его сообщение или напишите /a текст.",
+        )
         return
+    await submit_version(message, game, message.text)
+
+
+async def submit_version(message: Message, game: Game, text: str) -> None:
     if game.revealed:
-        await message.reply("Ответ уже открыт.")
+        await call_telegram(message.reply, "Ответ уже открыт.")
         return
-    verdict = judge(game.question, message.text)
-    await message.reply(verdict_text(player_name(message), verdict))
+    verdict = judge(game.question, text)
+    sent = await call_telegram(message.reply, verdict_text(player_name(message), verdict))
+    game.remember([sent.message_id], keep=True)
+    save_game(game)
     if verdict is Verdict.CORRECT and message.bot is not None:
         await reveal(message.bot, game, game.token, game.index)
 
@@ -417,13 +582,13 @@ async def cb_recent_pack(callback: CallbackQuery) -> None:
 async def cb_start(callback: CallbackQuery) -> None:
     message = callback.message
     if message is None:
-        await callback.answer()
+        await ack(callback)
         return
     game = _games.get(game_key(message.chat.id, message.message_thread_id))
     if game is None:
-        await callback.answer("Пакет уже не открыт. Пришлите ссылку ещё раз.")
+        await ack(callback, "Пакет уже не открыт. Пришлите ссылку ещё раз.")
         return
-    await callback.answer()
+    await ack(callback)
     async with game.lock:
         game.index = 0
         game.token += 1
@@ -433,27 +598,28 @@ async def cb_start(callback: CallbackQuery) -> None:
         await message.edit_reply_markup(reply_markup=None)
     except Exception:
         LOG.debug("could not hide the start button", exc_info=True)
-    await show_question(callback.bot, game)
+    origin = message if isinstance(message, Message) else None
+    await present(callback.bot, game, origin)
 
 
 @router.callback_query(F.data.startswith("a:"))
 async def cb_answer(callback: CallbackQuery) -> None:
     message = callback.message
     if message is None or callback.data is None:
-        await callback.answer()
+        await ack(callback)
         return
     game = _games.get(game_key(message.chat.id, message.message_thread_id))
     if game is None:
-        await callback.answer("Игра уже закончилась.")
+        await ack(callback, "Игра уже закончилась.")
         return
     index = _callback_index(callback.data)
     if index != game.index:
-        await callback.answer("Это уже не тот вопрос.")
+        await ack(callback, "Это уже не тот вопрос.")
         return
     if game.revealed:
-        await callback.answer("Ответ уже открыт.")
+        await ack(callback, "Ответ уже открыт.")
         return
-    await callback.answer()
+    await ack(callback)
     await reveal(callback.bot, game, game.token, game.index)
 
 
@@ -461,23 +627,56 @@ async def cb_answer(callback: CallbackQuery) -> None:
 async def cb_next(callback: CallbackQuery) -> None:
     message = callback.message
     if message is None or callback.data is None:
-        await callback.answer()
+        await ack(callback)
         return
     game = _games.get(game_key(message.chat.id, message.message_thread_id))
     if game is None:
-        await callback.answer("Игра уже закончилась.")
+        await ack(callback, "Игра уже закончилась.")
         return
     index = _callback_index(callback.data)
-    notice = await go_next(callback.bot, game, index)
+    await step_from_button(callback, game, index)
+
+
+@router.callback_query(F.data.startswith("b:"))
+async def cb_back(callback: CallbackQuery) -> None:
+    await ack(callback, "К другому вопросу: /q и номер.")
+
+
+@router.callback_query(F.data.startswith("r:"))
+async def cb_repeat(callback: CallbackQuery) -> None:
+    message = callback.message
+    if message is None or callback.data is None:
+        await ack(callback)
+        return
+    game = _games.get(game_key(message.chat.id, message.message_thread_id))
+    if game is None:
+        await ack(callback, "Игра уже закончилась.")
+        return
+    index = _callback_index(callback.data)
+    notice = await repeat_question(game, index)
+    if notice:
+        await ack(callback, notice)
+        return
+    await ack(callback)
+    target = message if isinstance(message, Message) else None
+    await present(callback.bot, game, target, announce_tour=False, keep_messages=True)
+
+
+async def step_from_button(callback: CallbackQuery, game: Game, index: int) -> None:
+    message = callback.message
+    notice = await move_question(game, index)
     if notice is None:
-        await callback.answer()
+        await ack(callback)
+        target = message if isinstance(message, Message) else None
+        await present(callback.bot, game, target)
         return
     if notice == "":
-        stop_game(message.chat.id, message.message_thread_id)
-        await callback.answer()
-        await message.answer("Пакет сыгран.")
+        await ack(callback)
+        if isinstance(message, Message):
+            stop_game(message.chat.id, message.message_thread_id)
+            await call_telegram(message.answer, "Пакет сыгран.")
         return
-    await callback.answer(notice)
+    await ack(callback, notice)
 
 
 @router.callback_query(F.data == "s")
@@ -555,7 +754,8 @@ async def setup_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Как играть"),
         BotCommand(command="packs", description="Свежие пакеты"),
         BotCommand(command="play", description="Открыть пакет по ссылке"),
-        BotCommand(command="q", description="Перейти к вопросу: /q 12"),
+        BotCommand(command="q", description="Где мы, или переход: /q 12"),
+        BotCommand(command="a", description="Сдать версию: /a ответ"),
         BotCommand(command="stop", description="Остановить игру"),
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())

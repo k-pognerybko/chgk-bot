@@ -7,6 +7,8 @@ from chgk_bot.parser import Question
 
 _BRACKET = re.compile(r"\[([^\[\]]*)]")
 _LABEL = re.compile(r"^(ответ|answer)\s+")
+_SYMBOL_LABEL = re.compile(r"^(ответ|answer)\s*[:\-—.]?\s*")
+_SENTENCE_MARKS = ".,:;!?…\"'«»“”"
 
 
 class Verdict(Enum):
@@ -26,10 +28,17 @@ def normalize(text: str) -> str:
 def judge(question: Question, guess: str) -> Verdict:
     accepted = _variants(question.answer) + _variants(question.accepted)
     rejected = _variants(question.rejected)
-    if not accepted:
+    accepted_symbols = _symbols(question.answer) + _symbols(question.accepted)
+    rejected_symbols = _symbols(question.rejected)
+    if not accepted and not accepted_symbols:
         return Verdict.UNKNOWN
+    symbol = _symbol_form(guess)
+    if symbol and symbol in rejected_symbols:
+        return Verdict.WRONG
+    if symbol and symbol in accepted_symbols:
+        return Verdict.CORRECT
     prepared = normalize(guess)
-    if not prepared:
+    if not prepared or not accepted:
         return Verdict.WRONG
     accepted_score = _best(prepared, accepted)
     rejected_score = _best(prepared, rejected)
@@ -50,6 +59,37 @@ def _variants(field: str) -> list[str]:
             if prepared and prepared not in found:
                 found.append(prepared)
     return found
+
+
+def _symbols(field: str) -> list[str]:
+    found: list[str] = []
+    for chunk in _chunks(field):
+        for expanded in _expand(chunk):
+            symbol = _symbol_form(expanded)
+            if symbol and symbol not in found:
+                found.append(symbol)
+    return found
+
+
+def _symbol_form(text: str) -> str:
+    cleaned = _SYMBOL_LABEL.sub("", text.lower().replace("ё", "е").strip())
+    words = re.sub(r"[^\w\s]+", " ", cleaned, flags=re.UNICODE)
+    words = re.sub(r"\s+", " ", words).strip()
+    if words:
+        return ""
+    tokens = [_symbol_token(token) for token in cleaned.split()]
+    marks = [token for token in tokens if token and all(char in _SENTENCE_MARKS for char in token)]
+    symbols = [token for token in tokens if token and token not in marks]
+    if symbols:
+        return "".join(symbols)
+    if not tokens:
+        return ""
+    return max(tokens, key=len)
+
+
+def _symbol_token(token: str) -> str:
+    core = token.strip(_SENTENCE_MARKS)
+    return core or token
 
 
 def _chunks(field: str) -> list[str]:

@@ -41,15 +41,17 @@ def save_game(game: "Game") -> None:
     connection.execute(
         """
         INSERT INTO games (
-            chat_id, thread_id, pack_json, question_index, revealed, started, question_message_id
+            chat_id, thread_id, pack_json, question_index, revealed, started,
+            question_message_id, message_ids
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chat_id, thread_id) DO UPDATE SET
             pack_json = excluded.pack_json,
             question_index = excluded.question_index,
             revealed = excluded.revealed,
             started = excluded.started,
-            question_message_id = excluded.question_message_id
+            question_message_id = excluded.question_message_id,
+            message_ids = excluded.message_ids
         """,
         (
             game.chat_id,
@@ -59,6 +61,7 @@ def save_game(game: "Game") -> None:
             int(game.revealed),
             int(game.started),
             game.question_message_id,
+            json.dumps(game.message_ids),
         ),
     )
     connection.commit()
@@ -80,11 +83,12 @@ def load_games() -> dict[tuple[int, int], "Game"]:
     connection = _connect()
     rows = connection.execute(
         """
-        SELECT chat_id, thread_id, pack_json, question_index, revealed, started, question_message_id
+        SELECT chat_id, thread_id, pack_json, question_index, revealed, started,
+               question_message_id, message_ids
         FROM games
         """
     )
-    for chat_id, thread_id, payload, index, revealed, started, message_id in rows:
+    for chat_id, thread_id, payload, index, revealed, started, message_id, raw_ids in rows:
         try:
             pack = _pack_from_dict(json.loads(payload))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -97,6 +101,9 @@ def load_games() -> dict[tuple[int, int], "Game"]:
         game.revealed = bool(revealed)
         game.started = bool(started)
         game.question_message_id = message_id
+        game.message_ids = _message_ids(raw_ids)
+        if message_id and message_id not in game.message_ids:
+            game.message_ids.append(message_id)
         games[(chat_id, thread_id or 0)] = game
     return games
 
@@ -116,12 +123,26 @@ def _connect() -> sqlite3.Connection:
                 revealed INTEGER NOT NULL,
                 started INTEGER NOT NULL,
                 question_message_id INTEGER,
+                message_ids TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (chat_id, thread_id)
             )
             """
         )
+        columns = {row[1] for row in _connection.execute("PRAGMA table_info(games)")}
+        if "message_ids" not in columns:
+            _connection.execute("ALTER TABLE games ADD COLUMN message_ids TEXT")
         _connection.commit()
     return _connection
+
+
+def _message_ids(raw: object) -> list[int]:
+    try:
+        loaded = json.loads(raw) if isinstance(raw, str) else []
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [item for item in loaded if isinstance(item, int)]
 
 
 def _pack_to_dict(pack: Pack) -> dict:
